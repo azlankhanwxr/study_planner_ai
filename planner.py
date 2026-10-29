@@ -9,11 +9,14 @@ from __future__ import annotations
 import io
 import json
 import re
+import time
 from typing import Any
 
 # "gemini-flash-latest" is Google's alias for the newest Flash model, so the app keeps working
 # when old model names are retired. You can pin a specific one (e.g. gemini-3.8-flash) in the sidebar.
 DEFAULT_MODEL = "gemini-flash-latest"
+# Used automatically if the main model stays overloaded (503) or rate-limited (429).
+DEFAULT_FALLBACK_MODEL = "gemini-flash-lite-latest"
 
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 _DAY_ALIASES = {d[:3].lower(): d for d in DAYS}
@@ -339,8 +342,54 @@ def weekly_hours(plan: dict) -> dict[str, float]:
 
 
 # --------------------------------------------------------------------------
-# Gemini call
+# Gemini call (with retries and a backup model)
 # --------------------------------------------------------------------------
+_TRANSIENT = ("503", "500", "502", "504", "UNAVAILABLE", "INTERNAL", "DEADLINE_EXCEEDED", "OVERLOADED", "HIGH DEMAND")
+_QUOTA = ("429", "RESOURCE_EXHAUSTED")
+
+
+def _kind(exc: Exception) -> str:
+    """Classify an API error: 'transient' (retry), 'quota' (try another model) or 'fatal'."""
+    text = str(exc).upper()
+    if any(m in text for m in _QUOTA):
+        return "quota"
+    if any(m in text for m in _TRANSIENT):
+        return "transient"
+    return "fatal"
+
+
+def call_with_fallback(
+    client: Any,
+    models: list[str],
+    contents: list,
+    config: Any,
+    retries: int = 3,
+    retry_delay: float = 2.0,
+    sleep=time.sleep,
+) -> tuple[Any, str]:
+    """Call Gemini. On 503-type errors wait and retry (2s, 4s, 8s); if the model stays
+    unavailable or is rate-limited, move on to the next model. Returns (response, model_used).
+    Auth / bad-request / unknown-model errors on the main model are raised immediately."""
+    first_error: Exception | None = None
+    for index, model in enumerate(models):
+        for attempt in range(retries + 1):
+            try:
+                return client.models.generate_content(model=model, contents=contents, config=config), model
+            except Exception as exc:  # noqa: BLE001 - SDK raises several error classes
+                kind = _kind(exc)
+                first_error = first_error or exc
+                if kind == "fatal":
+                    if index == 0:
+                        raise
+                    break  # a bad backup model should not hide the main model's problem
+                if kind == "transient" and attempt < retries:
+                    sleep(retry_delay * (2**attempt))
+                    continue
+                break  # quota, or retries used up: try the next model
+    assert first_error is not None
+    raise first_error
+
+
 def generate_plan(
     schedule: dict,
     settings: dict,
@@ -348,6 +397,10 @@ def generate_plan(
     model: str = DEFAULT_MODEL,
     client: Any = None,
     max_attempts: int = 2,
+    fallback_model: str | None = DEFAULT_FALLBACK_MODEL,
+    retries: int = 3,
+    retry_delay: float = 2.0,
+    sleep=time.sleep,
 ) -> dict:
     """Ask Gemini for a plan and return the cleaned, checked result."""
     if client is None:
@@ -368,9 +421,13 @@ def generate_plan(
         response_mime_type="application/json",
     )
 
+    models = [model]
+    if fallback_model and fallback_model.strip() and fallback_model.strip() != model:
+        models.append(fallback_model.strip())
+
     last_error: Exception | None = None
     for _ in range(max_attempts):
-        response = client.models.generate_content(model=model, contents=contents, config=config)
+        response, used = call_with_fallback(client, models, contents, config, retries, retry_delay, sleep)
         try:
             plan = normalize_plan(parse_json(getattr(response, "text", "") or ""))
         except PlanError as exc:
@@ -378,5 +435,6 @@ def generate_plan(
             continue
         plan["warnings"] += check_plan(plan, settings["window_start"], settings["window_end"], settings["days"])
         plan["weekly_hours"] = weekly_hours(plan)
+        plan["model_used"] = used
         return plan
     raise PlanError(f"{last_error} Please try again.")
