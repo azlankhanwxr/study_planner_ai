@@ -29,6 +29,8 @@ def render_result(result: dict) -> None:
     plan = result["plan"]
 
     st.subheader("Your plan")
+    if plan.get("model_used"):
+        st.caption(f"Generated with {plan['model_used']}")
     if plan["summary"]:
         st.write(plan["summary"])
     for warning in plan["warnings"]:
@@ -98,6 +100,10 @@ with st.sidebar:
     typed_key = st.text_input("Gemini API key", type="password", help="Free key: aistudio.google.com/apikey")
     api_key = typed_key.strip() or read_secret("GEMINI_API_KEY")
     model = st.text_input("Model", value=read_secret("GEMINI_MODEL") or planner.DEFAULT_MODEL)
+    fallback_model = st.text_input(
+        "Backup model (used if the main one is busy)",
+        value=read_secret("GEMINI_FALLBACK_MODEL") or planner.DEFAULT_FALLBACK_MODEL,
+    )
     if api_key:
         st.success("API key found", icon="🔑")
     else:
@@ -158,7 +164,13 @@ if generate:
         try:
             schedule = planner.load_schedule(uploaded.name, uploaded.getvalue())
             with st.spinner("Building your timetable..."):
-                plan = planner.generate_plan(schedule, settings, api_key=api_key, model=model.strip() or planner.DEFAULT_MODEL)
+                plan = planner.generate_plan(
+                    schedule,
+                    settings,
+                    api_key=api_key,
+                    model=model.strip() or planner.DEFAULT_MODEL,
+                    fallback_model=fallback_model,
+                )
             st.session_state["result"] = {"plan": plan}
         except (planner.ScheduleError, planner.PlanError) as exc:
             st.error(str(exc))
@@ -169,6 +181,8 @@ if generate:
                 hint = " Check that your API key is correct."
             elif "404" in message or "NOT_FOUND" in message:
                 hint = " Check the model name in the sidebar."
+            elif "503" in message or "UNAVAILABLE" in message:
+                hint = " Google's servers are busy. The app already retried and tried the backup model. Wait a minute and press the button again."
             elif "429" in message or "RESOURCE_EXHAUSTED" in message:
                 hint = " You hit the free-tier rate limit. Wait a minute and try again."
             st.error(f"Gemini request failed.{hint}")
