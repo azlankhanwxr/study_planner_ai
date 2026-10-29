@@ -207,5 +207,77 @@ class GenerateTests(unittest.TestCase):
             self.assertIn(expected, prompt)
 
 
+ERR_503 = "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand.', 'status': 'UNAVAILABLE'}}"
+
+
+class ScriptedClient:
+    """Each item is either an Exception to raise or a response text. Records (model, ...) per call."""
+
+    def __init__(self, *script):
+        self.script, self.models_called = list(script), []
+        self.models = self
+
+    def generate_content(self, model, contents, config):
+        self.models_called.append(model)
+        item = self.script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return pytypes.SimpleNamespace(text=item)
+
+
+class ResilienceTests(unittest.TestCase):
+    def run_plan(self, client, **kw):
+        delays = []
+        plan = planner.generate_plan(
+            {"kind": "text", "text": "x"}, SETTINGS, "k", client=client, sleep=delays.append, **kw
+        )
+        return plan, delays
+
+    def test_503_is_retried_with_backoff_then_succeeds(self):
+        client = ScriptedClient(RuntimeError(ERR_503), RuntimeError(ERR_503), json.dumps(GOOD))
+        plan, delays = self.run_plan(client)
+        self.assertEqual(delays, [2.0, 4.0])
+        self.assertEqual(client.models_called, ["gemini-flash-latest"] * 3)
+        self.assertEqual(plan["model_used"], "gemini-flash-latest")
+
+    def test_falls_back_to_backup_model_when_main_stays_busy(self):
+        client = ScriptedClient(*[RuntimeError(ERR_503)] * 4, json.dumps(GOOD))
+        plan, delays = self.run_plan(client)
+        self.assertEqual(delays, [2.0, 4.0, 8.0])
+        self.assertEqual(client.models_called[-1], "gemini-flash-lite-latest")
+        self.assertEqual(plan["model_used"], "gemini-flash-lite-latest")
+
+    def test_quota_error_goes_straight_to_backup_without_waiting(self):
+        client = ScriptedClient(RuntimeError("429 RESOURCE_EXHAUSTED"), json.dumps(GOOD))
+        plan, delays = self.run_plan(client)
+        self.assertEqual(delays, [])
+        self.assertEqual(plan["model_used"], "gemini-flash-lite-latest")
+
+    def test_bad_key_or_model_fails_immediately(self):
+        client = ScriptedClient(RuntimeError("400 INVALID_ARGUMENT. API key not valid"))
+        with self.assertRaises(RuntimeError):
+            self.run_plan(client)
+        self.assertEqual(len(client.models_called), 1)
+
+    def test_everything_busy_raises_original_error(self):
+        client = ScriptedClient(*[RuntimeError(ERR_503)] * 8)
+        with self.assertRaises(RuntimeError) as ctx:
+            self.run_plan(client)
+        self.assertIn("503", str(ctx.exception))
+        self.assertEqual(len(client.models_called), 8)  # 4 tries x 2 models
+
+    def test_broken_backup_model_does_not_hide_main_error(self):
+        client = ScriptedClient(*[RuntimeError(ERR_503)] * 4, RuntimeError("404 NOT_FOUND model"))
+        with self.assertRaises(RuntimeError) as ctx:
+            self.run_plan(client)
+        self.assertIn("503", str(ctx.exception))
+
+    def test_no_backup_when_disabled(self):
+        client = ScriptedClient(*[RuntimeError(ERR_503)] * 4)
+        with self.assertRaises(RuntimeError):
+            self.run_plan(client, fallback_model="")
+        self.assertEqual(set(client.models_called), {"gemini-flash-latest"})
+
+
 if __name__ == "__main__":
     unittest.main()
