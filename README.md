@@ -1,4 +1,3 @@
-# study_planner_ai
 # 📚 Study Planner AI
 
 Upload your class/work schedule, tell the app when you are free, and get:
@@ -106,6 +105,7 @@ To update the app later, just `git add . && git commit -m "message" && git push`
 |---------|-----|
 | "Check that your API key is correct" | Re-copy the key; make sure there are no spaces or quotes inside it |
 | "Check the model name" | Model names change. Type a current Flash model name in the sidebar (default `gemini-flash-latest` always points to the newest) |
+| `503 UNAVAILABLE` / "high demand" | Google's servers are temporarily overloaded. The app retries automatically (waits 2s, 4s, 8s) and then switches to a backup model. If it still fails, wait a minute and click the button again |
 | Rate limit (429) | The free tier has limits. Wait a minute and try again |
 | Timetable has clashes | The app shows warnings when the AI's plan breaks your free-time window or overlaps your commitments. Re-run or fix your file |
 | Photo not read correctly | Use a clearer, straight-on photo, or upload a CSV/text version |
